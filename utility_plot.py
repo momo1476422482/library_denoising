@@ -23,7 +23,8 @@ class visualise_data:
         self,
         col_name1: str,
         col_name2: str,
+        hue: Optional[str],
         path_save_fig: Path,
     ) -> None:
-        sns.lineplot(data=self.df, x=col_name1, y=col_name2)
+        sns.lineplot(data=self.df, x=col_name1, y=col_name2, hue=hue, marker="o")
         plt.savefig(path_save_fig)

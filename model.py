@@ -4,6 +4,7 @@ import cv2
 from utility import LocalisedPatches
 from tqdm import tqdm
 from typing import Optional, Tuple, List
+import pandas as pd
 
 
 class NLMeans:
@@ -22,13 +23,14 @@ class NLMeans:
         self.h = h
         self.sigma = sigma
         self.search_radius = radius
+        self.path2csv = Path(__file__).parent / "result_nlmeans.csv"
 
     # ===============================================================================================
-    def weight_patches(
+    def weigh_patches(
         self, patch_array_1: np.ndarray, patch_array_2: np.ndarray
     ) -> np.ndarray:
         """
-        calculate the weight between two patch arrays
+        calculate the weight  between two patch arrays
         """
 
         assert (
@@ -37,16 +39,34 @@ class NLMeans:
 
         assert len(patch_array_1.shape) == 2, "the input array should be 2-dimensional"
 
-        euclideanDistance = (
-            np.sqrt(
-                np.sum(
-                    np.square(patch_array_1 - patch_array_2),
-                    axis=1,
-                )
+        weight = (
+            np.sum(
+                np.square(patch_array_1 - patch_array_2),
+                axis=1,
             )
             - 2 * np.power(self.sigma, 2)
         )
-        return np.exp(-euclideanDistance / np.power(self.h, 2))
+
+        return np.exp(-weight / np.power(self.h, 2))
+
+    # ===============================================================================================
+    def get_patch(self, coordinate: Tuple[int, int], img: np.ndarray) -> np.ndarray:
+        x, y = coordinate
+        return img[
+            x - self.padwidth : x + self.padwidth + 1,
+            y - self.padwidth : y + self.padwidth + 1,
+        ]
+
+    # ===============================================================================================
+    def set_patch(
+        self, coordinate: Tuple[int, int], img: np.ndarray, value: np.ndarray
+    ) -> None:
+
+        x, y = coordinate
+        img[
+            x - self.padwidth : x + self.padwidth + 1,
+            y - self.padwidth : y + self.padwidth + 1,
+        ] = value
 
     # ===============================================================================================
     def img2patch(self, img: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -64,32 +84,26 @@ class NLMeans:
         self, coordinates: np.ndarray, patches: np.ndarray, img: np.ndarray
     ) -> np.ndarray:
         """
-        Reconstruct the image with the given list of patches and its locolisation
-        (inverse operation of img2patch)
+        Inverse operation of img2patch
         """
         img = np.zeros(img.shape)
-        img_index_final = np.zeros(img.shape)
+        img_weight_final = np.zeros(img.shape)
         for coordinate, patch in zip(coordinates, patches):
             img_zero = np.zeros(img.shape)
-            img_index = np.zeros(img.shape)
+            img_weight = np.zeros(img.shape)
             x, y = tuple(coordinate)
-            img_zero
-            img_zero[
-                x - self.padwidth : x + self.padwidth + 1,
-                y - self.padwidth : y + self.padwidth + 1,
-            ] = patch
+            self.set_patch(coordinate, img_zero, patch)
             img += img_zero
-            img_index[
-                x - self.padwidth : x + self.padwidth + 1,
-                y - self.padwidth : y + self.padwidth + 1,
-            ] = 1
-            img_index_final += img_index
-        return np.divide(img, img_index_final)
+            self.set_patch(coordinate, img_weight, 1)
+            img_weight_final += img_weight
+        return np.divide(img, img_weight_final)
 
     # ===============================================================================================
     def get_search_area(
-        self, coordinate: Tuple[int, int], img: np.ndarray
-    ) -> np.ndarray:
+        self,
+        coordinate: Tuple[int, int],
+        img: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
         get the surrounded image of a given pixel
         """
@@ -98,29 +112,24 @@ class NLMeans:
         right_bord = min(center_pixel_x + self.search_radius, img.shape[1])
         high_bord = max(center_pixel_y - self.search_radius, 0)
         low_bord = min(center_pixel_y + self.search_radius, img.shape[1])
-        return img[left_bord : right_bord + 1, high_bord : low_bord + 1]
+        top_left = (left_bord, high_bord)
+        return img[left_bord : right_bord + 1, high_bord : low_bord + 1], top_left
 
     # ===============================================================================================
     def get_weights_search_area(
-        self, coordinate: Tuple[int, int], img: np.ndarray
+        self, coordinate: Tuple[int, int], img: np.ndarray, search_area: np.ndarray
     ) -> np.ndarray:
         """
-        calculate the weights between the concerned patch(centered at the given pixel)
+        calculate the weights between the current patch(centered at the given pixel)
         and the other patches on the search area
         """
 
-        surrounded_img = self.get_search_area(coordinate, img)
-        patches, coordinates = self.img2patch(surrounded_img)
-
-        center_x, center_y = coordinate
+        patches, coordinates = self.img2patch(search_area)
         center_patch = np.tile(
-            img[
-                center_x - self.padwidth : center_x + self.padwidth + 1,
-                center_y - self.padwidth : center_y + self.padwidth + 1,
-            ].reshape(1, -1),
+            self.get_patch(coordinate, img).reshape(1, -1),
             (patches.shape[0], 1),
         )
-        return self.weight_patches(center_patch, patches.reshape(patches.shape[0], -1))
+        return self.weigh_patches(center_patch, patches.reshape(patches.shape[0], -1))
 
     # ===============================================================================================
     def denoise_pixel(
@@ -131,71 +140,35 @@ class NLMeans:
         """
         process of denoising one pixel
         """
-        weights = self.get_weights_search_area(coordinate, input_img)
-        surrounded_img = self.get_search_area(coordinate, input_img)
+        search_area, top_left = self.get_search_area(coordinate, input_img)
+        weights = self.get_weights_search_area(coordinate, input_img, search_area)
         totalweights = sum(weights)
-        center_img = surrounded_img[
-            self.padwidth : surrounded_img.shape[0] - self.padwidth,
-            self.padwidth : surrounded_img.shape[1] - self.padwidth,
-        ]
-        return np.dot(weights, center_img.reshape(-1, 3)) / totalweights
-
-    # ===============================================================================================
-    def convert_coordinate_original_img_2_search_area(
-        self, coordinate: Tuple[int, int], img: np.ndarray
-    ) -> np.ndarray:
-        """
-        convert the coordinate of the given pixel from original image to its search area
-        """
-        center_x, center_y = coordinate
-        search_area = self.get_search_area(coordinate, img)
-        patches, coordinates = self.img2patch(search_area)
-        for coordinate, patch in zip(coordinates, patches):
-            centerd_patch = img[
-                center_x - self.padwidth : center_x + self.padwidth + 1,
-                center_y - self.padwidth : center_y + self.padwidth + 1,
-                :,
-            ]
-            res = (centerd_patch == patch).all()
-            if res:
-                return coordinate
-
-    # ===============================================================================================
-    def convert_coordinates_search_area_2_original_img(
-        self, coordinate: Tuple[int, int], img: np.ndarray
-    ) -> np.ndarray:
-        """
-        convert the coordinates of the surrounding patches of the given pixel
-        from search area to original image
-        """
-        coordinate_surrounded_img = self.convert_coordinate_original_img_2_search_area(
-            coordinate, img
+        center_img = self.crop_img(search_area)
+        return (
+            np.dot(weights, center_img.reshape(-1, search_area.shape[2])) / totalweights
         )
-        surrounded_img = self.get_search_area(coordinate, img)
-        patches, coordinates = self.img2patch(surrounded_img)
-        return coordinates - coordinate_surrounded_img + np.array(coordinate)
 
     # ===============================================================================================
     def get_list_nearest_coordinates(
-        self, coordinate: Tuple[int, int], nb_nbhd: int, img: np.ndarray
+        self, coordinate: Tuple[int, int], nb_neighbors: int, img: np.ndarray
     ) -> List[Tuple[int, int]]:
         """
         get the list of the nearest patches of the given pixel
-        parameter nb_nbhd :  the number of the neares patches
+        parameter nb_neighbors :  the number of the neares patches
         """
-        weights = self.get_weights_search_area(coordinate, img)
-        coordinates_orig_img = self.convert_coordinates_search_area_2_original_img(
-            coordinate, img
-        )
-        return coordinates_orig_img[np.argsort(weights)[::-1][:nb_nbhd]].tolist()
+        search_area, top_left = self.get_search_area(coordinate, img)
+        patches, coordinates = self.img2patch(search_area)
+        weights = self.get_weights_search_area(coordinate, img, search_area)
+        coordinates_orig_img = coordinates + np.array(top_left)
+        return coordinates_orig_img[np.argsort(weights)[::-1][:nb_neighbors]].tolist()
 
     # ===============================================================================================
-    def plot_mask_nbhd(
+    def plot_patch_selection(
         self,
         coordinate: Tuple[int, int],
         img: np.ndarray,
         path_mask: Path,
-        nb_nbhd: int = 5,
+        nb_neighbors: int = 5,
     ) -> List[Tuple[int, int]]:
         """
         plot the nearest patches of a pixel
@@ -203,29 +176,16 @@ class NLMeans:
         """
         mask = img.copy()
 
-        # plot the concerned patch
-        center_start_x, center_start_y = tuple(np.array(coordinate) - self.padwidth)
-        center_end_x, center_end_y = tuple(np.array(coordinate) + self.padwidth)
-        mask[center_start_x : center_end_x + 1, center_start_y : center_end_y + 1] = (
-            0,
-            255,
-            0,
-        )
         # plot the nearest patches
         res: List[Tuple[int, int]] = []
         list_nearest_coordinates = self.get_list_nearest_coordinates(
-            coordinate, nb_nbhd, img
+            coordinate, nb_neighbors, img
         )
         for coord in list_nearest_coordinates:
-            coord = np.array(coord)
-            start_point_x, start_point_y = tuple(np.array(coord) - self.padwidth)
-            end_point_x, end_point_y = tuple(np.array(coord) + self.padwidth)
-            mask[start_point_x : end_point_x + 1, start_point_y : end_point_y + 1] = (
-                255,
-                0,
-                0,
-            )
-            res.append((start_point_x, start_point_y))
+            if list_nearest_coordinates.index(coord) == 0:
+                self.set_patch(coord, mask, (0, 255, 0))
+            self.set_patch(coord, mask, (255, 0, 0))
+            res.append((np.array(coord) - self.padwidth))
         cv2.imwrite(str(path_mask), mask)
         return res
 
@@ -237,13 +197,43 @@ class NLMeans:
         ]
 
     # ===============================================================================================
-    def __call__(self, path_img: Path) -> np.ndarray:
-        assert path_img.is_file(), f"{path_img} does not exist"
-        input_img = cv2.imread(str(path_img))
-        output_img = np.zeros_like(input_img)
+    def add_noise(self, img: np.ndarray, sigma: int) -> np.ndarray:
+        return img + np.random.randn(*(img.shape)) * sigma
 
-        for i in tqdm(range(self.padwidth, input_img.shape[0] - self.padwidth)):
-            for j in range(self.padwidth, input_img.shape[1] - self.padwidth):
-                output_img[i, j] = self.denoise_pixel((i, j), input_img)
+    # ===============================================================================================
+    def denoise_img(self, img: np.ndarray) -> np.ndarray:
+        output_img = np.zeros_like(img)
+        for i in tqdm(range(self.padwidth, img.shape[0] - self.padwidth)):
+            for j in range(self.padwidth, img.shape[1] - self.padwidth):
+                output_img[i, j] = self.denoise_pixel((i, j), img)
 
         return self.crop_img(output_img)
+
+    # ===============================================================================================
+    def get_RMSE(self, img_ref: np.ndarray, img_pred: np.ndarray) -> float:
+        orig_img = self.crop_img(img_ref)
+        assert img_pred.shape == orig_img.shape
+        return np.sqrt(np.sum(np.power((img_pred - orig_img), 2)) / img_pred.size)
+
+    # ===============================================================================================
+    def save_to_csv(self, img_name: str, RMSE: float):
+        data = {"image_name": img_name, "sigma": self.sigma, "RMSE": RMSE, "h": self.h}
+        if not self.path2csv.is_file():
+            data_result = pd.DataFrame.from_dict([data])
+            data_result.to_csv(self.path2csv)
+        else:
+            data_result = pd.read_csv(self.path2csv)
+            df = [data_result, pd.DataFrame.from_dict([data])]
+            data_result = pd.concat(df)
+            data_result.to_csv(self.path2csv, index=False)
+        print(data_result.to_string())
+
+    # ===============================================================================================
+    def __call__(self, path_img: Path, sigma: int) -> np.ndarray:
+        assert path_img.is_file(), f"{path_img} does not exist"
+        img_orig = cv2.imread(str(path_img))
+        noisy_img = self.add_noise(img_orig, sigma)
+        denoised_img = self.denoise_img(noisy_img)
+        cv2.imwrite(str(path_img.parent / f"denoised_{path_img.name}"), denoised_img)
+        RMSE = self.get_RMSE(img_orig, denoised_img)
+        self.save_to_csv(path_img.stem, RMSE)
